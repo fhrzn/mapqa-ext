@@ -5,6 +5,7 @@ from argparse import ArgumentParser
 from typing import List
 
 import httpx
+from geonamescache import GeonamesCache
 from tqdm.asyncio import tqdm
 
 from src.schema.schema import OSMPOI
@@ -82,29 +83,19 @@ def parse_element(
         poi_class=poi_class,
         poi_type=poi_type,
         name=tags.get("name", ""),
-        city=tags.get("addr:city") or tags.get("addr:district") or city,
+        city=tags.get("addr:city") or tags.get("addr:district") or city["name"],
         country=tags.get("addr:country") or country,
         country_code=tags.get("addr:country_code") or country_code,
         bounding_box=bbox,
     )
 
 
-def get_pois_qbuilder(
-    city: str, poi_classes: List[str], admin_levels: List[int] = [4, 5, 6]
-):
-    levels = "|".join(str(lvl) for lvl in admin_levels)
-    return f"""
-        [out:json][timeout:120];
-        area["name"~"{city}"]["admin_level"~"{levels}"]->.city;
-        (
-            {"".join(f'    {elem}["{cls}"](area.city);' + chr(10) for cls in poi_classes for elem in ["node", "way", "relation"])}
-        );
-        out bb tags;
-    """.strip()
-
-
 async def overpass_request(
-    client: httpx.AsyncClient, url: str, query: str, timeout: int = 60
+    client: httpx.AsyncClient,
+    url: str,
+    timeout: int = 60,
+    *,
+    query: str,
 ):
     response = await client.post(
         url=url,
@@ -121,6 +112,7 @@ async def get_cities(
     url: str,
     timeout: int = 60,
     *,
+    country_name: str,
     country_code: str,
     admin_level: str,
 ):
@@ -136,7 +128,7 @@ async def get_cities(
     """.strip()
 
     try:
-        res = await overpass_request(client, url, query, timeout)
+        res = await overpass_request(client, url, timeout, query=query)
         res = res.get("elements", [])
         cities = [
             {
@@ -144,6 +136,7 @@ async def get_cities(
                 "area_id": r["id"] + 3600000000,
                 "name": r["tags"].get("name"),
                 "country_code": country_code,
+                "country": country_name["name"],
                 "lat": r["center"].get("lat"),
                 "lon": r["center"].get("lon"),
             }
@@ -157,71 +150,105 @@ async def get_cities(
         return
 
 
-async def query_poi(
+async def get_pois(
     client: httpx.AsyncClient,
     url: str,
-    country: str,
-    country_code: str,
-    city: str,
+    timeout: int = 60,
+    *,
+    item: dict,
     poi_classes: List[str],
 ):
-    query = get_pois_qbuilder(city, poi_classes)
-    await asyncio.sleep(5)
-    response = await client.post(
-        url, data={"data": query}, timeout=60, headers={"User-Agent": "mapqa-ext-sea"}
-    )
+    query = f"""
+        [out:json][timeout:120];
+        area({item.get("area_id")})->.city;
+        (
+            {"".join(f'    {elem}["{cls}"](area.city);' + chr(10) for cls in poi_classes for elem in ["node", "way", "relation"])}
+        );
+        out bb tags;
+    """.strip()
+
     try:
-        elements = response.json().get("elements", [])
-        if not elements:
-            print(f"[WARN] POI query on {city} returned an empty result.")
-            return elements
+        res = await overpass_request(client, url, timeout, query=query)
+        res = res.get("elements", [])
+        if not res:
+            print(f"[WARN] POI query on `{item.get('name')}` returned an empty result.")
+            return res
 
         pois = [
             p.model_dump()
-            for elem in elements
-            if (p := parse_element(elem, country, country_code, city)) is not None
+            for elem in res
+            if (
+                p := parse_element(
+                    elem, item.get("country"), item.get("country_code"), item
+                )
+            )
+            is not None
         ]
 
         return pois
+
     except Exception as e:
-        print(response.content.decode())
+        print(f"[ERROR] POI query on `{item.get('name')}` returned an error.")
         print(e)
+        return
 
 
 async def main(args):
     url = os.path.join(args.url, OVERPASS_ENDPOINT)
+    gc = GeonamesCache()
+
+    ### step 1: get city relations ###
+    if os.path.exists(os.path.join(args.output_dir, "cities.json")):
+        cities = json.loads(
+            open(os.path.join(args.output_dir, "cities.json"), "r").read()
+        )
+    else:
+        print("Get cities...")
+        async with httpx.AsyncClient() as client:
+            tasks = [
+                get_cities(
+                    client,
+                    url,
+                    country_name=gc.get_countries().get(v["country_code"]),
+                    **v,
+                )
+                for v in COUNTRY_ADMIN_MAPPING.values()
+            ]
+            results = await tqdm.gather(*tasks)
+        # merge result
+        cities = [it for items in results for it in items]
+        with open(os.path.join(args.output_dir, "cities.json"), "w") as f:
+            f.write(json.dumps(cities, indent=4, ensure_ascii=False))
+
+    ### step 2: get pois ###
+    print("Get POIs...")
+    semaphore = asyncio.Semaphore(50)
+
+    async def _wrapper_get_poi(sem, client, url, item, poi_classes):
+        async with sem:
+            await asyncio.sleep(1)
+            return await get_pois(client, url, item=item, poi_classes=poi_classes)
 
     async with httpx.AsyncClient() as client:
         tasks = [
-            get_cities(client, url, **v)
-            for v in COUNTRY_ADMIN_MAPPING.values()
+            _wrapper_get_poi(
+                semaphore, client, url, item=item, poi_classes=args.poi_classes
+            )
+            for item in cities
         ]
+
         results = await tqdm.gather(*tasks)
     # merge result
-    cities = [it for items in results for it in items]
-    with open(os.path.join(args.output_dir, "countries.json"), "w") as f:
-        f.write(json.dumps(cities, indent=4, ensure_ascii=False))
+    all_pois = [item for sublist in results for item in sublist if sublist is not None]
+    output_path = os.path.join(args.output_dir, "pois.json")
+    with open(output_path, "w") as f:
+        f.write(json.dumps(all_pois, indent=4))
 
-    # async with httpx.AsyncClient() as client:
-    #     tasks = [
-    #         query_poi(client, url, args.country, country_code, city, args.poi_classes)
-    #         for city in cities
-    #     ]
-
-    #     results = await tqdm.gather(*tasks)
-
-    # all_pois = [item for sublist in results for item in sublist]
-    # with open(args.output_path, "w") as f:
-    #     f.write(json.dumps(all_pois, indent=4))
-
-    # print(f"Successfully write output to: {args.output_path}")
+    print(f"Successfully write output to: {output_path}")
 
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    # parser.add_argument(
-    #     "--country", help="Country name that POIs want to collect", required=True
-    # )
     parser.add_argument(
         "--poi-classes",
         nargs="+",
