@@ -87,6 +87,7 @@ def parse_element(
         country=tags.get("addr:country") or country,
         country_code=tags.get("addr:country_code") or country_code,
         bounding_box=bbox,
+        extra_tags=tags,
     )
 
 

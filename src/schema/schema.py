@@ -14,3 +14,4 @@ class OSMPOI(BaseModel):
     country: str
     country_code: str
     bounding_box: List[float]
+    extra_tags: dict | None
