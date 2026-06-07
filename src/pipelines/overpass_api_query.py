@@ -5,13 +5,13 @@ from argparse import ArgumentParser
 from typing import List
 
 import httpx
+from dotenv import load_dotenv
 from geonamescache import GeonamesCache
 from tqdm.asyncio import tqdm
 
 from src.schema.schema import OSMPOI
 
 POI_CLASSES = ["amenity", "shop", "tourism", "leisure", "office", "historic"]
-DEFAULT_HOST = "http://100.69.181.117:4567/"
 OVERPASS_ENDPOINT = "api/interpreter"
 COUNTRY_ADMIN_MAPPING = {
     "Indonesia": {
@@ -195,7 +195,7 @@ async def get_pois(
 
 
 async def main(args):
-    url = os.path.join(args.url, OVERPASS_ENDPOINT)
+    url = os.path.join(args.host, OVERPASS_ENDPOINT)
     gc = GeonamesCache()
 
     ### step 1: get city relations ###
@@ -249,6 +249,7 @@ async def main(args):
 
 
 if __name__ == "__main__":
+    load_dotenv()
     parser = ArgumentParser()
     parser.add_argument(
         "--poi-classes",
@@ -260,6 +261,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output-dir", help="Output directory of generated files", required=True
     )
-    parser.add_argument("--url", help="Overpass API URL", default=DEFAULT_HOST)
+    parser.add_argument(
+        "--host", help="Overpass API URL", default=os.getenv("OVERPASS_API_HOST")
+    )
     args = parser.parse_args()
     asyncio.run(main(args))
